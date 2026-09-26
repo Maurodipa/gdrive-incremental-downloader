@@ -1,0 +1,18 @@
+# File sensibili OAuth — non condividere mai
+credentials.json
+token.json
+
+# Database di stato e log
+gdrive_state.db
+gdrive_downloader.log
+audit_report*.txt
+
+# Cartella di backup (solitamente troppo grande per Git)
+gdrive_backup/
+
+# Ambiente virtuale Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
