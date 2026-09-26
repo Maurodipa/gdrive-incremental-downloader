@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import time
@@ -35,6 +36,7 @@ from typing import Optional
 
 # ── Dipendenze esterne (vedi requirements.txt) ────────────────────────────────
 try:
+    import httplib2
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -403,7 +405,9 @@ def with_backoff(func, *args, logger: logging.Logger, max_retries: int = MAX_RET
     """
     Esegue `func(*args, **kwargs)` con exponential backoff su:
       - HttpError con status 429, 500, 502, 503, 504
-      - Eccezioni di rete generiche (ConnectionError, TimeoutError, ecc.)
+      - Eccezioni di rete generiche (ConnectionError, TimeoutError, OSError)
+      - httplib2.ServerNotFoundError  ← caduta DNS / connessione persa
+      - socket.gaierror               ← risoluzione DNS fallita
 
     Solleva l'ultima eccezione se esaurisce i tentativi.
     """
@@ -420,7 +424,13 @@ def with_backoff(func, *args, logger: logging.Logger, max_retries: int = MAX_RET
                 time.sleep(wait)
             else:
                 raise  # Errori non recuperabili (401, 403, 404…)
-        except (ConnectionError, TimeoutError, OSError) as exc:
+        except (
+            ConnectionError,
+            TimeoutError,
+            OSError,
+            socket.gaierror,
+            httplib2.error.ServerNotFoundError,
+        ) as exc:
             wait = base ** attempt
             logger.warning(
                 "Errore di rete (%s) — tentativo %d/%d, attesa %.0fs…",
@@ -470,35 +480,44 @@ class PathResolver:
     def resolve_ancestors(self, parents: list[str],
                            visited: Optional[set] = None) -> list[str]:
         """
-        Restituisce la lista ordinata di nomi cartelle dalla radice alla foglia.
-        Gestisce cicli (rari ma possibili in Drive) tramite `visited`.
+        Restituisce la lista ordinata di nomi cartelle dalla radice alla foglia,
+        risalendo iterativamente la gerarchia dei parent.
+        Versione iterativa: nessun rischio di RecursionError su alberi molto profondi.
+        Gestisce cicli tramite `visited`.
         """
         if not parents:
             return []
-        if visited is None:
-            visited = set()
 
-        parent_id = parents[0]
-        if parent_id in visited:
-            return []  # Ciclo rilevato, interrompi la ricorsione
-        visited.add(parent_id)
+        path_segments: list[str] = []
+        seen: set[str] = set(visited) if visited else set()
+        current_id = parents[0]
 
-        try:
-            meta = with_backoff(
-                self.service.files().get(
-                    fileId=parent_id,
-                    fields="name,parents,mimeType",
-                ).execute,
-                logger=self.logger,
-            )
-        except HttpError:
-            return []
+        while current_id:
+            if current_id in seen:
+                break  # Ciclo rilevato
+            seen.add(current_id)
 
-        if meta.get("mimeType") == "application/vnd.google-apps.folder":
+            try:
+                meta = with_backoff(
+                    self.service.files().get(
+                        fileId=current_id,
+                        fields="name,parents,mimeType",
+                    ).execute,
+                    logger=self.logger,
+                )
+            except (HttpError, RuntimeError):
+                break
+
+            if meta.get("mimeType") != "application/vnd.google-apps.folder":
+                break
+
+            path_segments.append(meta.get("name", current_id))
             grandparents = meta.get("parents", [])
-            ancestor_path = self.resolve_ancestors(grandparents, visited)
-            return ancestor_path + [meta.get("name", parent_id)]
-        return []
+            current_id = grandparents[0] if grandparents else None
+
+        # L'iterazione risale dalla foglia alla radice → invertiamo
+        path_segments.reverse()
+        return path_segments
 
 
 # ══════════════════════════════════════════════════════════════════════════════
