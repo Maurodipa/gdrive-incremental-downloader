@@ -446,55 +446,63 @@ def with_backoff(func, *args, logger: logging.Logger, max_retries: int = MAX_RET
 
 class PathResolver:
     """
-    Risolve ricorsivamente l'alberatura di Google Drive, costruendo per ogni
-    file il percorso locale corrispondente.
+    Risolve l'alberatura di Google Drive costruendo per ogni file il percorso
+    locale corrispondente.
 
-    I metadati cartelle sono cachati in memoria per ridurre le chiamate API.
+    OTTIMIZZAZIONE CHIAVE — cache del percorso completo per folder ID:
+      - La prima volta che si incontra una cartella, si risale tutta la gerarchia
+        fino alla radice con chiamate API e si memorizza il percorso completo.
+      - Ogni file successivo nella stessa cartella (o in una cartella già vista)
+        riceve il percorso direttamente dalla cache → 0 chiamate API aggiuntive.
+      - Durante la risalita vengono cachati anche tutti i percorsi intermedi,
+        così cartelle "sorelle" a qualsiasi livello beneficiano subito della cache.
+
+    Risultato: da O(depth × n_files) a O(unique_folders × depth) chiamate API.
     """
 
     def __init__(self, service, logger: logging.Logger):
         self.service = service
         self.logger = logger
-        # cache: drive_id → nome cartella
-        self._folder_cache: dict[str, str] = {}
+        # cache: folder_id → lista completa di nomi dalla radice alla cartella
+        # Es: "folder_xyz" → ["Documenti", "Lavoro", "2025"]
+        self._path_cache: dict[str, list[str]] = {}
 
-    def get_folder_name(self, folder_id: str) -> str:
-        """Recupera il nome di una cartella, con cache in memoria."""
-        if folder_id in self._folder_cache:
-            return self._folder_cache[folder_id]
-
-        try:
-            meta = with_backoff(
-                self.service.files().get(
-                    fileId=folder_id, fields="name"
-                ).execute,
-                logger=self.logger,
-            )
-            name = meta.get("name", folder_id)
-        except HttpError:
-            name = folder_id
-
-        self._folder_cache[folder_id] = name
-        return name
-
-    def resolve_ancestors(self, parents: list[str],
-                           visited: Optional[set] = None) -> list[str]:
+    def resolve_ancestors(self, parents: list[str]) -> list[str]:
         """
-        Restituisce la lista ordinata di nomi cartelle dalla radice alla foglia,
-        risalendo iterativamente la gerarchia dei parent.
-        Versione iterativa: nessun rischio di RecursionError su alberi molto profondi.
-        Gestisce cicli tramite `visited`.
+        Restituisce la lista ordinata di nomi cartelle dalla radice alla foglia.
+
+        Algoritmo:
+          1. Controlla se il parent diretto è già in cache → ritorno immediato.
+          2. Altrimenti risale iterativamente la gerarchia fino alla radice
+             o a un nodo già cachato.
+          3. Costruisce il percorso completo e popola la cache per ogni
+             nodo intermedio incontrato durante la risalita.
         """
         if not parents:
             return []
 
-        path_segments: list[str] = []
-        seen: set[str] = set(visited) if visited else set()
-        current_id = parents[0]
+        parent_id = parents[0]
+
+        # ── Fast path: cache hit esatto ──────────────────────────────────────
+        if parent_id in self._path_cache:
+            return self._path_cache[parent_id]
+
+        # ── Risalita iterativa dalla foglia alla radice ───────────────────────
+        # chain_ids[i], chain_names[i] = cartella incontrata nell'ordine leaf→root
+        chain_ids: list[str] = []
+        chain_names: list[str] = []
+        seen: set[str] = set()
+        current_id: Optional[str] = parent_id
+        cached_prefix: list[str] = []  # percorso già noto se troviamo un nodo cachato
 
         while current_id:
+            # Cache hit su un antenato intermedio → usiamo il suo percorso come prefisso
+            if current_id in self._path_cache:
+                cached_prefix = self._path_cache[current_id]
+                break
+
             if current_id in seen:
-                break  # Ciclo rilevato
+                break  # ciclo in Drive (raro ma possibile)
             seen.add(current_id)
 
             try:
@@ -511,13 +519,26 @@ class PathResolver:
             if meta.get("mimeType") != "application/vnd.google-apps.folder":
                 break
 
-            path_segments.append(meta.get("name", current_id))
+            chain_ids.append(current_id)
+            chain_names.append(meta.get("name", current_id))
+
             grandparents = meta.get("parents", [])
             current_id = grandparents[0] if grandparents else None
 
-        # L'iterazione risale dalla foglia alla radice → invertiamo
-        path_segments.reverse()
-        return path_segments
+        # ── Ricostruzione percorsi e popolamento cache ────────────────────────
+        # chain_ids/chain_names vanno da leaf→root; invertiamo per avere root→leaf
+        chain_ids.reverse()
+        chain_names.reverse()
+
+        # Per ogni nodo nella catena, calcola e cacha il percorso completo
+        # Es. chain = ["Documenti", "Lavoro", "2025"] con prefix = []
+        #   → "Documenti_id"          : ["Documenti"]
+        #   → "Lavoro_id"             : ["Documenti", "Lavoro"]
+        #   → "2025_id" (= parent_id) : ["Documenti", "Lavoro", "2025"]
+        for i, (fid, fname) in enumerate(zip(chain_ids, chain_names)):
+            self._path_cache[fid] = cached_prefix + chain_names[: i + 1]
+
+        return self._path_cache.get(parent_id, cached_prefix)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -531,8 +552,22 @@ def scan_drive(service, db: StateDB, output_dir: str,
     Riprende dall'ultimo pageToken salvato in caso di interruzione.
     """
     page_token = db.get_page_token()
+
+    # ── Stato del DB dalla sessione precedente ────────────────────────────────
+    prev_counts = db.count_by_status()
+    prev_total = sum(prev_counts.values())
+    if prev_total > 0:
+        logger.info(
+            "DB esistente: %d file già registrati "
+            "(completati=%d  in-attesa=%d  errori=%d)",
+            prev_total,
+            prev_counts.get("completed", 0),
+            prev_counts.get("pending", 0),
+            prev_counts.get("error", 0),
+        )
+
     if page_token:
-        logger.info("Ripresa scansione dal pageToken salvato.")
+        logger.info("Ripresa scansione dal pageToken salvato (nuovi file da questa sessione: 0)…")
     else:
         logger.info("Inizio scansione completa di Google Drive…")
 
@@ -541,7 +576,8 @@ def scan_drive(service, db: StateDB, output_dir: str,
         "files(id,name,mimeType,md5Checksum,size,parents,trashed)"
     )
 
-    total_found = 0
+    # Conta i file nuovi trovati in questa sessione
+    session_found = 0
 
     while True:
         params = {
@@ -560,7 +596,7 @@ def scan_drive(service, db: StateDB, output_dir: str,
         )
 
         files = response.get("files", [])
-        total_found += len(files)
+        session_found += len(files)
 
         for item in files:
             mime_type = item.get("mimeType", "")
@@ -596,14 +632,23 @@ def scan_drive(service, db: StateDB, output_dir: str,
         page_token = response.get("nextPageToken")
         db.save_page_token(page_token)
 
-        logger.info("  Scansionati %d file fin ora…", total_found)
+        # Mostra totale cumulativo = sessioni precedenti + questa sessione
+        cumulative = prev_total + session_found
+        logger.info(
+            "  Scansionati %d nuovi in questa sessione  (totale DB: %d)…",
+            session_found, cumulative,
+        )
 
         if not page_token:
             break
 
     # Scansione completata: cancella il page_token salvato
     db.save_page_token(None)
-    logger.info("Scansione completata. Totale file trovati: %d", total_found)
+    final_total = sum(db.count_by_status().values())
+    logger.info(
+        "Scansione completata. Nuovi questa sessione: %d  |  Totale nel DB: %d",
+        session_found, final_total,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
