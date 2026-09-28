@@ -181,14 +181,18 @@ class StateDB:
       mime_type     TEXT              — MIME type Drive
       md5_drive     TEXT              — checksum MD5 da Drive (NULL per Workspace)
       size_bytes    INTEGER           — dimensione in byte (NULL per Workspace)
-      status        TEXT              — 'pending' | 'completed' | 'error'
+      status        TEXT              — 'pending' | 'completed' | 'error' | 'skipped'
       error_count   INTEGER           — numero di tentativi falliti
       last_updated  TEXT              — timestamp ISO 8601 dell'ultimo aggiornamento
+
+    Status 'skipped': file che l'API non è in grado di fornire (es. troppo grande
+    per l'export Workspace). Non vengono riaccodati e sono riportati nell'audit.
     """
 
     STATUS_PENDING = "pending"
     STATUS_COMPLETED = "completed"
     STATUS_ERROR = "error"
+    STATUS_SKIPPED = "skipped"
 
     def __init__(self, db_path: str = DB_FILE):
         self.db_path = db_path
@@ -228,7 +232,7 @@ class StateDB:
         """
         Inserisce un nuovo record oppure aggiorna i metadati se già esiste.
         Non sovrascrive 'status', 'error_count' o 'last_updated' su record
-        già completati.
+        già completati o saltati (skipped).
         """
         now = datetime.now(timezone.utc).isoformat()
         self._conn.execute("""
@@ -243,7 +247,7 @@ class StateDB:
                 md5_drive    = excluded.md5_drive,
                 size_bytes   = excluded.size_bytes,
                 last_updated = CASE
-                    WHEN status = 'completed' THEN last_updated
+                    WHEN status IN ('completed', 'skipped') THEN last_updated
                     ELSE excluded.last_updated
                 END
         """, (drive_id, name, local_path, mime_type, md5_drive, size_bytes, now))
@@ -271,6 +275,18 @@ class StateDB:
         )
         self._conn.commit()
 
+    def mark_skipped(self, drive_id: str, reason: str = ""):
+        """
+        Marca un file come 'skipped': non verrà mai riaccodato.
+        Usato per file che l'API non può fornire (es. exportSizeLimitExceeded).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "UPDATE files SET status='skipped', last_updated=? WHERE drive_id=?",
+            (now, drive_id),
+        )
+        self._conn.commit()
+
     def reset_to_pending(self, drive_id: str):
         """Rimette in coda un file (es. dopo hash mismatch o file rimosso)."""
         now = datetime.now(timezone.utc).isoformat()
@@ -283,7 +299,7 @@ class StateDB:
     # ── Query ────────────────────────────────────────────────────────────────
 
     def get_pending_files(self) -> list:
-        """Restituisce tutti i file in stato 'pending' o 'error'."""
+        """Restituisce tutti i file in stato 'pending' o 'error' (esclude 'skipped' e 'completed')."""
         cur = self._conn.execute(
             "SELECT * FROM files WHERE status IN ('pending', 'error') ORDER BY drive_id"
         )
@@ -674,6 +690,13 @@ def download_file(service, row: sqlite3.Row,
     # ── File temporaneo per download sicuro ──────────────────────────────────
     tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
 
+    def _safe_unlink(path: Path):
+        """Elimina un file ignorando errori di lock su Windows."""
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            logger.warning("  Impossibile eliminare il file temporaneo (lock): %s", path)
+
     try:
         if mime_type in WORKSPACE_EXPORT_MAP:
             success = _download_workspace(service, drive_id, name,
@@ -687,17 +710,21 @@ def download_file(service, row: sqlite3.Row,
             if local_path.exists():
                 local_path.unlink()
             tmp_path.rename(local_path)
-            return True
+            return "ok"
         else:
-            if tmp_path.exists():
-                tmp_path.unlink()
-            return False
+            _safe_unlink(tmp_path)
+            return "error"
+
+    except ExportTooLargeError as exc:
+        # File Workspace troppo grande anche per il fallback PDF → skip permanente
+        logger.warning("  SKIPPED (troppo grande per l'export): %s", name)
+        _safe_unlink(tmp_path)
+        return "skipped"
 
     except Exception as exc:
-        logger.error("Eccezione durante il download di '%s': %s", name, exc)
-        if tmp_path.exists():
-            tmp_path.unlink()
-        return False
+        logger.error("Eccezione durante il download di '%s': %s", name, exc, exc_info=False)
+        _safe_unlink(tmp_path)
+        return "error"
 
 
 def _download_binary(service, drive_id: str, name: str,
@@ -741,22 +768,61 @@ def _download_binary(service, drive_id: str, name: str,
     return True
 
 
+class ExportTooLargeError(Exception):
+    """Sollevata quando Drive rifiuta l'export per dimensione eccessiva."""
+
+
 def _download_workspace(service, drive_id: str, name: str,
                         mime_type: str, tmp_path: Path,
                         logger: logging.Logger) -> bool:
     """
     Esporta un file nativo Google Workspace nel formato Office corrispondente.
     Per questi file non è disponibile l'MD5; il successo si basa su HTTP 200.
+
+    Strategia per exportSizeLimitExceeded (file > ~10MB):
+      1. Prova il formato primario (es. .docx).
+      2. Se fallisce per dimensione, ritenta in PDF.
+      3. Se anche il PDF fallisce → solleva ExportTooLargeError (file 'skipped').
     """
     export_ext, export_mime = WORKSPACE_EXPORT_MAP[mime_type]
     logger.debug("  Export Workspace: %s → %s", name, export_ext)
 
-    with_backoff(
-        _do_workspace_export,
-        service, drive_id, export_mime, tmp_path,
-        logger=logger,
-    )
-    return True
+    try:
+        with_backoff(
+            _do_workspace_export,
+            service, drive_id, export_mime, tmp_path,
+            logger=logger,
+        )
+        return True
+    except HttpError as exc:
+        is_size_limit = (
+            exc.resp.status == 403
+            and "exportSizeLimitExceeded" in str(exc.error_details)
+        )
+        if not is_size_limit:
+            raise  # altro 403 (permessi, ecc.) → ri-solleva normalmente
+
+        # ── Fallback PDF ──────────────────────────────────────────────────
+        if export_mime != "application/pdf":
+            logger.warning(
+                "  Export %s troppo grande, provo PDF come fallback: %s",
+                export_ext, name,
+            )
+            pdf_tmp = tmp_path.with_suffix(".pdf.tmp")
+            try:
+                with_backoff(
+                    _do_workspace_export,
+                    service, drive_id, "application/pdf", pdf_tmp,
+                    logger=logger,
+                )
+                pdf_tmp.replace(tmp_path)
+                logger.info("  ✓ Fallback PDF riuscito: %s", name)
+                return True
+            except HttpError:
+                pdf_tmp.unlink(missing_ok=True)
+                logger.warning("  Anche il fallback PDF è fallito: %s", name)
+
+        raise ExportTooLargeError(name)
 
 
 def _do_workspace_export(service, drive_id: str, export_mime: str,
@@ -766,11 +832,13 @@ def _do_workspace_export(service, drive_id: str, export_mime: str,
         fileId=drive_id, mimeType=export_mime
     )
     fh = io.FileIO(str(tmp_path), mode="wb")
-    downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    fh.close()
+    try:
+        downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    finally:
+        fh.close()  # garantisce la chiusura anche in caso di eccezione (evita PermissionError su Windows)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -809,17 +877,21 @@ def run_download(service, db: StateDB, output_dir: str,
 
     ok = 0
     errors = 0
+    skipped = 0
 
     for idx, row in enumerate(pending, start=1):
         drive_id = row["drive_id"]
         name = row["name"]
         logger.info("[%d/%d] %s", idx, total, name)
 
-        success = download_file(service, row, logger)
+        result = download_file(service, row, logger)
 
-        if success:
+        if result == "ok":
             db.mark_completed(drive_id)
             ok += 1
+        elif result == "skipped":
+            db.mark_skipped(drive_id)
+            skipped += 1
         else:
             db.mark_error(drive_id)
             errors += 1
@@ -827,8 +899,8 @@ def run_download(service, db: StateDB, output_dir: str,
 
     logger.info("═" * 60)
     logger.info(
-        "Download completato — OK: %d  Errori: %d  Totale: %d",
-        ok, errors, total,
+        "Download completato — OK: %d  Errori: %d  Saltati: %d  Totale: %d",
+        ok, errors, skipped, total,
     )
 
 
